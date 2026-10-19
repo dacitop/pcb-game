@@ -214,7 +214,7 @@ html, body {
     });
   } catch(e) {}
 
-  const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbyhPyJ-Gr2lfLvd7fpw_XlGwJ20RTsaXzjhtUcc0TmRmqeLgcqKpshtH7YtcoSDHYOfUg/exec';
+  const GAS_API_URL = 'https://script.google.com/macros/s/AKfycby_W75Z3s_dMsAr36Pc_KmXA8mtYHUScD0ZqeEw_0Fj1sDAvuGNYm4rU8e9gxvlJbOO2g/exec';
   const hasGasRunner = typeof google !== 'undefined' && google.script && google.script.run;
   
   // 1. 動態從試算表題目庫加載最新題目
@@ -243,29 +243,68 @@ html, body {
     } catch(e) {}
   }
 
-  // 檢查 Email 是否已有正式成績（完全以雲端試算表為唯一準則）
+  // 記憶體快取與請求去重（大幅減少展場併發重複查詢）
+  const emailCheckCache = {};
+  const inFlightChecks = {};
+
+  // 檢查 Email 是否已有正式成績（完全以雲端試算表為唯一準則，附帶極速記憶體快取）
   function checkCloudEmail(email, cb) {
+    const norm = normalizeEmail(email);
+    if (!norm) return cb(false);
+
+    if (emailCheckCache[norm] !== undefined) {
+      return cb(emailCheckCache[norm]);
+    }
+
+    if (inFlightChecks[norm]) {
+      inFlightChecks[norm].then(res => cb(res));
+      return;
+    }
+
     if (hasGasRunner) {
-      google.script.run.withSuccessHandler(res => {
-        cb(!!(res && res.hasOfficial));
-      }).withFailureHandler(() => {
-        cb(false);
-      }).checkEmailOfficialStatus(email);
+      const p = new Promise(resolve => {
+        google.script.run.withSuccessHandler(res => {
+          const has = !!(res && res.hasOfficial);
+          emailCheckCache[norm] = has;
+          resolve(has);
+        }).withFailureHandler(() => {
+          resolve(false);
+        }).checkEmailOfficialStatus(norm);
+      });
+      inFlightChecks[norm] = p;
+      p.then(res => {
+        delete inFlightChecks[norm];
+        cb(res);
+      });
     } else {
-      fetch(GAS_API_URL + '?action=checkEmail&email=' + encodeURIComponent(email))
+      const p = fetch(GAS_API_URL + '?action=checkEmail&email=' + encodeURIComponent(norm))
         .then(r => r.json())
-        .then(res => cb(!!(res && res.hasOfficial)))
-        .catch(() => cb(false));
+        .then(res => {
+          const has = !!(res && res.hasOfficial);
+          emailCheckCache[norm] = has;
+          return has;
+        })
+        .catch(() => false);
+      inFlightChecks[norm] = p;
+      p.then(res => {
+        delete inFlightChecks[norm];
+        cb(res);
+      });
     }
   }
 
-  // 上傳成績至 Google Sheet
-  function uploadScoreToCloud(payload, cb) {
+  // 上傳成績至 Google Sheet（具備工業級自動重試排隊防護網，展場併發零遺漏）
+  function uploadScoreToCloud(payload, cb, retryCount = 0) {
+    const maxRetries = 3;
     if (hasGasRunner) {
       google.script.run.withSuccessHandler(res => {
         cb(res);
       }).withFailureHandler(err => {
-        cb(null);
+        if (retryCount < maxRetries) {
+          setTimeout(() => uploadScoreToCloud(payload, cb, retryCount + 1), 1500 * (retryCount + 1));
+        } else {
+          cb(null);
+        }
       }).recordScore(payload);
     } else {
       fetch(GAS_API_URL, {
@@ -273,8 +312,24 @@ html, body {
         body: JSON.stringify(payload)
       })
       .then(r => r.json())
-      .then(res => cb(res))
-      .catch(() => cb(null));
+      .then(res => {
+        if (res && res.success) {
+          cb(res);
+        } else if (res && res.alreadyDone) {
+          cb(res);
+        } else if (retryCount < maxRetries) {
+          setTimeout(() => uploadScoreToCloud(payload, cb, retryCount + 1), 1500 * (retryCount + 1));
+        } else {
+          cb(res);
+        }
+      })
+      .catch(err => {
+        if (retryCount < maxRetries) {
+          setTimeout(() => uploadScoreToCloud(payload, cb, retryCount + 1), 1500 * (retryCount + 1));
+        } else {
+          cb(null);
+        }
+      });
     }
   }
 
@@ -746,22 +801,12 @@ html, body {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
   }
 
-  // 監聽 Email 輸入框失焦自動檢查雲端正式成績狀態
-  $('#email').addEventListener('input', () => {
-    $('#practiceBtn').classList.add('hidden');
-    $('#startBtn').classList.remove('hidden');
-    $('#startBtn').disabled = false;
-    $('#nameMsg').textContent = '成績將自動同步至雲端試算表。';
-    $('#nameMsg').style.color = 'var(--muted)';
-    $('#nameMsg').style.fontWeight = 'normal';
-  });
-
-  $('#email').addEventListener('blur', () => {
-    const emailVal = $('#email').value.trim();
+  let emailDebounceTimer = null;
+  function triggerEmailPrecheck(emailVal) {
     if (emailVal && validEmail(emailVal)) {
-      $('#nameMsg').textContent = '🔍 正在驗證 E-mail 認證資格...';
-      $('#nameMsg').style.color = '#15a7ff';
-      checkCloudEmail(emailVal, (has) => {
+      const norm = normalizeEmail(emailVal);
+      checkCloudEmail(norm, (has) => {
+        if (normalizeEmail($('#email').value) !== norm) return;
         if (has) {
           $('#nameMsg').textContent = '🎉 您已是被認證過的 PCB 人囉！每位挑戰者僅限認證一次。';
           $('#nameMsg').style.color = '#ff3a8a';
@@ -778,11 +823,52 @@ html, body {
         }
       });
     }
+  }
+
+  // 監聽 Email 輸入框自動背景預查狀態
+  $('#email').addEventListener('input', () => {
+    $('#practiceBtn').classList.add('hidden');
+    $('#startBtn').classList.remove('hidden');
+    $('#startBtn').disabled = false;
+    $('#nameMsg').textContent = '成績將自動同步至雲端試算表。';
+    $('#nameMsg').style.color = 'var(--muted)';
+    $('#nameMsg').style.fontWeight = 'normal';
+
+    if (emailDebounceTimer) clearTimeout(emailDebounceTimer);
+    const emailVal = $('#email').value.trim();
+    if (emailVal && validEmail(emailVal)) {
+      emailDebounceTimer = setTimeout(() => {
+        triggerEmailPrecheck(emailVal);
+      }, 400);
+    }
+  });
+
+  $('#email').addEventListener('blur', () => {
+    if (emailDebounceTimer) clearTimeout(emailDebounceTimer);
+    const emailVal = $('#email').value.trim();
+    triggerEmailPrecheck(emailVal);
   });
 
   $('#soundBtn').addEventListener('click',()=>{ unlockAudio(); soundOn=!soundOn; $('#soundBtn').textContent = soundOn ? '🔊 音效：開' : '🔇 音效：關'; });
   $('#musicBtn').addEventListener('click',()=>{ unlockAudio(); musicOn=!musicOn; $('#musicBtn').textContent = musicOn ? '🎵 答題節奏：開' : '🎵 答題節奏：關'; if(!$('#quiz').classList.contains('hidden') && musicOn) startMusic(); else stopMusic(); });
   
+  function launchQuiz() {
+    try { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); } catch(e) {}
+    isPracticeAttempt = false;
+    $('#startBtn').disabled = false;
+    unlockAudio();
+    sfx('start');
+    buildGame();
+    $('#playerBadge').textContent='👤 '+player;
+    $('#start').classList.add('hidden');
+    $('#result').classList.add('hidden');
+    $('#quiz').classList.remove('hidden');
+    notifyParentState('quiz', 620);
+    scrollToTop('#quizAnchor');
+    startMusic();
+    render();
+  }
+
   $('#startBtn').addEventListener('click',()=>{
     unlockAudio();
     const emailVal=$('#email').value.trim();
@@ -814,12 +900,27 @@ html, body {
     participantEmail=normalizeEmail(emailVal);
     player=nickVal.slice(0,12);
 
+    // ★★★ 0秒秒進優化：如果背景預查已確認有效，完全不需等待，直接開打！
+    if (emailCheckCache[participantEmail] === false) {
+      launchQuiz();
+      return;
+    }
+
+    if (emailCheckCache[participantEmail] === true) {
+      $('#nameMsg').textContent = '🎉 您已是被認證過的 PCB 人囉！每位挑戰者僅限認證一次。';
+      $('#nameMsg').style.color = '#ff3a8a';
+      $('#nameMsg').style.fontWeight = '900';
+      $('#startBtn').classList.add('hidden');
+      $('#practiceBtn').classList.remove('hidden');
+      return;
+    }
+
     $('#startBtn').disabled = true;
     $('#nameMsg').textContent = '🔍 正在驗證 E-mail 認證資格...';
     $('#nameMsg').style.color = '#15a7ff';
     $('#nameMsg').style.fontWeight = 'normal';
 
-    // 嚴格檢查是否已認證過
+    // 嚴格檢查是否已認證過（若尚未在快取中）
     checkCloudEmail(participantEmail, (has) => {
       if (has) {
         $('#nameMsg').textContent = '🎉 您已是被認證過的 PCB 人囉！每位挑戰者僅限認證一次。';
@@ -830,20 +931,7 @@ html, body {
         return; // 嚴格阻擋！不進入正式測驗！
       }
 
-      try { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); } catch(e) {}
-      isPracticeAttempt = false;
-      $('#startBtn').disabled = false;
-      unlockAudio();
-      sfx('start');
-      buildGame();
-      $('#playerBadge').textContent='👤 '+player;
-      $('#start').classList.add('hidden');
-      $('#result').classList.add('hidden');
-      $('#quiz').classList.remove('hidden');
-      notifyParentState('quiz', 620);
-      scrollToTop('#quizAnchor');
-      startMusic();
-      render();
+      launchQuiz();
     });
   });
 
