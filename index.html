@@ -214,7 +214,7 @@ html, body {
     });
   } catch(e) {}
 
-  const GAS_API_URL = 'https://script.google.com/macros/s/AKfycby_W75Z3s_dMsAr36Pc_KmXA8mtYHUScD0ZqeEw_0Fj1sDAvuGNYm4rU8e9gxvlJbOO2g/exec';
+  const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbwq4RXDMlgk1gl1mu7sDzIcnZz3GuFmC9NZoFaU9Ev6JupjUPttPf-Ge1B24W1Z_ycd_Q/exec';
   const hasGasRunner = typeof google !== 'undefined' && google.script && google.script.run;
   
   // 1. 動態從試算表題目庫加載最新題目
@@ -834,8 +834,11 @@ html, body {
     $('#nameMsg').style.color = 'var(--muted)';
     $('#nameMsg').style.fontWeight = 'normal';
 
-    if (emailDebounceTimer) clearTimeout(emailDebounceTimer);
     const emailVal = $('#email').value.trim();
+    const norm = normalizeEmail(emailVal);
+    delete emailCheckCache[norm]; // 輸入變更時清除快取，以試算表即時資料為準
+
+    if (emailDebounceTimer) clearTimeout(emailDebounceTimer);
     if (emailVal && validEmail(emailVal)) {
       emailDebounceTimer = setTimeout(() => {
         triggerEmailPrecheck(emailVal);
